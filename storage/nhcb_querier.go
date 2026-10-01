@@ -15,6 +15,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -28,6 +29,36 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/annotations"
 )
+
+const (
+	// NHCBAsClassicLabel is the control label that configures NHCB-to-classic
+	// conversion per selector when NHCBAsClassicQuerier is active.
+	//
+	// Matchers on this label are stripped before querying the underlying storage:
+	//   - "true": enables NHCB-to-classic conversion for the selector.
+	//   - "false" (or matchers that match "" or "false" and neither "true" nor
+	//     "debug", such as != "true" or = ""): disables conversion and returns
+	//     stored classic series unchanged.
+	//   - "debug" (or =~ "true|debug"): enables conversion and attaches
+	//     FromNHCBLabel ("true" for converted NHCB series, "false" for stored
+	//     classic series) to all returned series without merging stored and
+	//     converted series into a single labelset.
+	//   - =~ "false|debug": disables conversion and attaches FromNHCBLabel="false"
+	//     to all returned stored classic series.
+	NHCBAsClassicLabel = "__nhcb_as_classic__"
+
+	// FromNHCBLabel is the label added to returned series when a selector uses
+	// debug mode (__nhcb_as_classic__="debug" or =~"true|debug"): "true" for
+	// classic series converted from NHCB, and "false" for stored classic series.
+	// Unlike NHCBAsClassicLabel, it is a regular label on returned series;
+	// matchers on FromNHCBLabel are passed through to the underlying storage.
+	FromNHCBLabel = "__from_nhcb__"
+)
+
+// errOnlyControlMatchers is returned when a selector's only non-empty matchers
+// are on NHCBAsClassicLabel, because stripping them would leave an empty
+// selector that selects all series from the underlying storage.
+var errOnlyControlMatchers = fmt.Errorf("vector selector must contain at least one non-empty matcher besides %s", NHCBAsClassicLabel)
 
 // Known limitations of the NHCB-to-classic conversion:
 //
@@ -70,15 +101,31 @@ func (s *NHCBAsClassicStorage) Querier(mint, maxt int64) (Querier, error) {
 
 // Select implements the Querier interface.
 func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hints *SelectHints, matchers ...*labels.Matcher) SeriesSet {
-	nameMatcher, suffix, classicMatchers, leMatchers := extractHistogramSuffix(matchers)
+	strippedMatchers, convert, debug, matched, err := extractControlMatchers(matchers, true)
+	if err != nil {
+		return ErrSeriesSet(err)
+	}
+	if !matched {
+		return NoopSeriesSet()
+	}
+
+	nameMatcher, suffix, classicMatchers, leMatchers := extractHistogramSuffix(strippedMatchers)
 	if suffix == "" {
 		// Not a classic histogram query, pass through.
-		return q.Querier.Select(ctx, sortSeries, hints, matchers...)
+		return q.Querier.Select(ctx, sortSeries, hints, strippedMatchers...)
+	}
+
+	if !convert {
+		classicSet := q.Querier.Select(ctx, sortSeries, hints, strippedMatchers...)
+		if debug {
+			return newFromNHCBSeriesSet(classicSet, "false")
+		}
+		return classicSet
 	}
 
 	baseNameMatcher := newBaseNameMatcher(nameMatcher.Type, nameMatcher.Value, suffix)
 	if baseNameMatcher == nil {
-		return q.Querier.Select(ctx, sortSeries, hints, matchers...)
+		return q.Querier.Select(ctx, sortSeries, hints, strippedMatchers...)
 	}
 
 	nhcbMatchers := make([]*labels.Matcher, 0, len(classicMatchers))
@@ -111,7 +158,10 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 	// the classic query with all original matchers (preserving le pushdown and
 	// streaming directly from the underlying Querier).
 	if firstNHCB == nil {
-		classicSet := q.Querier.Select(ctx, sortSeries, hints, matchers...)
+		classicSet := q.Querier.Select(ctx, sortSeries, hints, strippedMatchers...)
+		if debug {
+			classicSet = newFromNHCBSeriesSet(classicSet, "false")
+		}
 		if w := nhcbSet.Warnings(); len(w) > 0 {
 			return &warningsSeriesSet{SeriesSet: classicSet, warnings: w}
 		}
@@ -152,6 +202,7 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 			nhcbSet:    nhcbSet,
 			leMatchers: leMatchers,
 			suffix:     suffix,
+			debug:      debug,
 			warnings:   warnings,
 		}
 	}
@@ -204,9 +255,132 @@ func (q *NHCBAsClassicQuerier) Select(ctx context.Context, sortSeries bool, hint
 		leMatchers: leMatchers,
 		suffix:     suffix,
 		sortSeries: sortSeries,
+		debug:      debug,
 		warnings:   warnings,
 	}
 }
+
+func isNHCBControlMatcher(m *labels.Matcher) bool {
+	return m.Name == NHCBAsClassicLabel
+}
+
+func matchesAllControl(val string, ms []*labels.Matcher) bool {
+	for _, m := range ms {
+		if !m.Matches(val) {
+			return false
+		}
+	}
+	return true
+}
+
+// hasPositiveDebugMatcher reports whether at least one matcher positively
+// selects "debug" without also matching the empty value or both "true" and
+// "false".
+//
+// NOTE: A negative matcher such as __nhcb_as_classic__!="true" or a broad
+// wildcard such as __nhcb_as_classic__=~".+" matches the string "debug" under
+// standard matcher semantics, but is intended to toggle conversion rather than
+// enable debug label injection.
+func hasPositiveDebugMatcher(ms []*labels.Matcher) bool {
+	for _, m := range ms {
+		if (m.Type == labels.MatchEqual || m.Type == labels.MatchRegexp) &&
+			m.Matches("debug") && !m.Matches("") && !(m.Matches("true") && m.Matches("false")) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractControlMatchers strips any NHCBAsClassicLabel matchers from matchers
+// and evaluates whether conversion and debug mode are enabled for the selector.
+// When no NHCBAsClassicLabel matcher is present, matchers is returned as-is
+// without allocating.
+func extractControlMatchers(matchers []*labels.Matcher, defaultConvert bool) (stripped []*labels.Matcher, convert, debug, matched bool, err error) {
+	if !slices.ContainsFunc(matchers, isNHCBControlMatcher) {
+		return matchers, defaultConvert, false, true, nil
+	}
+
+	var controlMatchers []*labels.Matcher
+	stripped = make([]*labels.Matcher, 0, len(matchers)-1)
+	for _, m := range matchers {
+		if isNHCBControlMatcher(m) {
+			controlMatchers = append(controlMatchers, m)
+		} else {
+			stripped = append(stripped, m)
+		}
+	}
+	if !slices.ContainsFunc(stripped, func(m *labels.Matcher) bool { return !m.Matches("") }) {
+		return nil, false, false, false, errOnlyControlMatchers
+	}
+
+	matchTrue := matchesAllControl("true", controlMatchers)
+	matchFalse := matchesAllControl("false", controlMatchers)
+	matchEmpty := matchesAllControl("", controlMatchers)
+	matchDebug := matchesAllControl("debug", controlMatchers) && hasPositiveDebugMatcher(controlMatchers)
+
+	debug = matchDebug
+	switch {
+	case matchTrue && matchFalse && !matchDebug:
+		return stripped, defaultConvert, false, true, nil
+	case matchTrue || (matchDebug && !matchFalse):
+		return stripped, true, debug, true, nil
+	case matchFalse || matchEmpty:
+		return stripped, false, debug, true, nil
+	default:
+		return stripped, false, false, false, nil
+	}
+}
+
+func withFromNHCB(lset labels.Labels, val string, b *labels.Builder) labels.Labels {
+	if b == nil {
+		b = labels.NewBuilder(lset)
+	} else {
+		b.Reset(lset)
+	}
+	b.Set(FromNHCBLabel, val)
+	return b.Labels()
+}
+
+type relabeledSeries struct {
+	Series
+	lset labels.Labels
+}
+
+func (s relabeledSeries) Labels() labels.Labels { return s.lset }
+
+type fromNHCBSeriesSet struct {
+	SeriesSet
+	val     string
+	builder *labels.Builder
+	cur     Series
+}
+
+func newFromNHCBSeriesSet(ss SeriesSet, val string) SeriesSet {
+	return &fromNHCBSeriesSet{
+		SeriesSet: ss,
+		val:       val,
+		builder:   labels.NewBuilder(labels.EmptyLabels()),
+	}
+}
+
+func (s *fromNHCBSeriesSet) Next() bool {
+	if !s.SeriesSet.Next() {
+		s.cur = nil
+		return false
+	}
+	ser := s.SeriesSet.At()
+	if ser == nil {
+		s.cur = nil
+		return true
+	}
+	s.cur = relabeledSeries{
+		Series: ser,
+		lset:   withFromNHCB(ser.Labels(), s.val, s.builder),
+	}
+	return true
+}
+
+func (s *fromNHCBSeriesSet) At() Series { return s.cur }
 
 type warningsSeriesSet struct {
 	SeriesSet
@@ -404,6 +578,7 @@ type nhcbToClassicSeriesSet struct {
 	leMatchers []*labels.Matcher
 	suffix     string
 	sortSeries bool
+	debug      bool
 	warnings   annotations.Annotations
 
 	initialized bool
@@ -566,6 +741,12 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 		out := dst[:0]
 		for _, cs := range g.classic {
 			if matchesLe(cs.Labels(), s.leMatchers) {
+				if s.debug {
+					cs = relabeledSeries{
+						Series: cs,
+						lset:   withFromNHCB(cs.Labels(), "false", s.lsetBuilder),
+					}
+				}
 				out = append(out, cs)
 			}
 		}
@@ -585,6 +766,12 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 		}
 		for _, cs := range g.classic {
 			if matchesLe(cs.Labels(), s.leMatchers) {
+				if s.debug {
+					cs = relabeledSeries{
+						Series: cs,
+						lset:   withFromNHCB(cs.Labels(), "false", s.lsetBuilder),
+					}
+				}
 				filteredClassic = append(filteredClassic, cs)
 			}
 		}
@@ -606,11 +793,17 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 		if len(converted) == 0 {
 			converted = seriesFromNHCB
 		} else if len(seriesFromNHCB) > 0 {
-			converted = mergeSeriesByLabels(converted, seriesFromNHCB)
+			converted, err = mergeSeriesByLabels(converted, seriesFromNHCB)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	out := mergeSeriesByLabels(filteredClassic, converted)
+	out, err := mergeSeriesByLabels(filteredClassic, converted)
+	if err != nil {
+		return nil, err
+	}
 	sortConvertedSeries(out)
 	return out, nil
 }
@@ -619,6 +812,9 @@ func (s *nhcbToClassicSeriesSet) convertGroup(g *histogramGroup, dst []Series) (
 // shadowing samples at timestamps where the stored classic histogram is active.
 func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []int64, dst []Series) ([]Series, error) {
 	nhcbLabels := nhcbSeries.Labels()
+	if s.debug {
+		nhcbLabels = withFromNHCB(nhcbLabels, "true", s.lsetBuilder)
+	}
 	s.it = nhcbSeries.Iterator(s.it)
 	if s.it == nil {
 		return nil, nil
@@ -717,13 +913,13 @@ func (s *nhcbToClassicSeriesSet) convertNHCBSeries(nhcbSeries Series, groupTS []
 
 // mergeSeriesByLabels combines preferred (e.g. stored classic) and fallback
 // (e.g. converted NHCB) series, merging any pair with identical labels via
-// storedWins.
-func mergeSeriesByLabels(preferred, fallback []Series) []Series {
+// mergeSamples.
+func mergeSeriesByLabels(preferred, fallback []Series) ([]Series, error) {
 	if len(preferred) == 0 {
-		return fallback
+		return fallback, nil
 	}
 	if len(fallback) == 0 {
-		return preferred
+		return preferred, nil
 	}
 
 	out := make([]Series, 0, len(preferred)+len(fallback))
@@ -734,7 +930,11 @@ func mergeSeriesByLabels(preferred, fallback []Series) []Series {
 		for i, f := range fallback {
 			if !usedFallback[i] && labels.Equal(pLabels, f.Labels()) {
 				usedFallback[i] = true
-				merged = storedWins(merged, f)
+				var err error
+				merged, err = mergeSamples(merged, f)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 		out = append(out, merged)
@@ -744,7 +944,7 @@ func mergeSeriesByLabels(preferred, fallback []Series) []Series {
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // collectClassicTimestamps returns the sorted, deduplicated timestamps of all
@@ -792,23 +992,6 @@ func collectClassicTimestamps(series []Series, it chunkenc.Iterator) ([]int64, c
 	return ts, it, nil
 }
 
-// storedWins returns a Series that merges samples from classic and converted in
-// timestamp order, preferring classic when both have a sample at the same
-// timestamp (unless classic is a staleness marker and converted has a live
-// value).
-func storedWins(classic, converted Series) Series {
-	merged, err := mergeSamples(classic, converted)
-	if err != nil {
-		return &SeriesEntry{
-			Lset: classic.Labels(),
-			SampleIteratorFn: func(chunkenc.Iterator) chunkenc.Iterator {
-				return errIterator{err: err}
-			},
-		}
-	}
-	return merged
-}
-
 type sampleSource uint8
 
 const (
@@ -817,6 +1000,9 @@ const (
 	srcB
 )
 
+// mergeSamples returns a Series that merges samples from a and b in timestamp
+// order, preferring a (e.g. stored classic) when both have a sample at the same
+// timestamp (unless a is a staleness marker and b has a live value).
 func mergeSamples(a, b Series) (Series, error) {
 	itA := a.Iterator(nil)
 	itB := b.Iterator(nil)
