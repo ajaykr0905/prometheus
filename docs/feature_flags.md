@@ -393,6 +393,4 @@ histogram_quantile(0.95, rate(request_duration_seconds_bucket[5m]))
 rate(request_duration_seconds[5m])
 ```
 
-This feature only affects PromQL query evaluation. It does not apply to remote write
-(NHCB series are not converted when being forwarded to remote endpoints) and does not
-affect the series API (the `/api/v1/series` endpoint will not return the converted classic series).
+This feature only affects PromQL query evaluation. When both stored classic histogram series and NHCB series exist for the same metric and labels, stored classic samples take precedence at timestamps where both are present, and disjoint time ranges (for example, across a migration cutover) are merged into a single classic series. It does not apply to remote write (NHCB series are not converted when being forwarded to remote endpoints) and does not affect the series API (the `/api/v1/series` endpoint will not return the converted classic series).
